@@ -4,6 +4,7 @@ pragma solidity ^0.8.0;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
 
 enum YieldMode {
     AUTOMATIC,
@@ -135,7 +136,7 @@ interface IBlast {
         );
 }
 
-contract WETHStakingBlastRoulette is Ownable, ReentrancyGuard {
+contract WETHStakingBlastRoulette is Ownable, ReentrancyGuard, Pausable {
     IERC20 public weth;
 
     struct RewardData {
@@ -150,16 +151,15 @@ contract WETHStakingBlastRoulette is Ownable, ReentrancyGuard {
 
     event Staked(address indexed user, uint256 amount);
     event Withdrawn(address indexed user, uint256 amount);
+    event FundsSentToGame(address indexed gameAddress, uint256 amount);
 
     mapping(address => RewardData[]) public userRewards;
+    mapping(address => bool) private isStaker;
 
-    address public authorizedContract;
+    mapping(address => bool) public authorizedContracts;
 
-    modifier onlyAuthorized() {
-        require(
-            msg.sender == authorizedContract,
-            "Only authorized contract can call this function"
-        );
+    modifier onlyAuthorizedContract() {
+        require(authorizedContracts[msg.sender], "Not authorized");
         _;
     }
 
@@ -167,17 +167,14 @@ contract WETHStakingBlastRoulette is Ownable, ReentrancyGuard {
     address public USDB_ADDRESS = 0x4300000000000000000000000000000000000003;
     address public WETH_ADDRESS = 0x4300000000000000000000000000000000000004;
     address public POINTS_OPERATOR = 0xE49a44F442ff9201884716510b3B87ea70F4F16e;
-    address public FEE_ADDRESS = 0x61157d454A8AF822fb2402875bAD4769e36C3a40;
+    address public GAME_ADDRESS = 0x063E680575E344273b3a026880E9041935F90473;
 
     IBlast public constant BLAST =
         IBlast(0x4300000000000000000000000000000000000002);
 
-    constructor(address _weth, address _authorizedContract)
-        Ownable(msg.sender)
-    {
-        weth = IERC20(_weth);
-        authorizedContract = _authorizedContract;
-
+    constructor() Ownable(msg.sender) {
+        weth = IERC20(WETH_ADDRESS);
+        authorizedContracts[GAME_ADDRESS] = true;
         IERC20Rebasing(USDB_ADDRESS).configure(YieldMode.CLAIMABLE);
         IERC20Rebasing(WETH_ADDRESS).configure(YieldMode.CLAIMABLE);
 
@@ -185,11 +182,27 @@ contract WETHStakingBlastRoulette is Ownable, ReentrancyGuard {
         BLAST.configureClaimableGas();
     }
 
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function addAuthorizedContract(address _contract) external onlyOwner {
+        authorizedContracts[_contract] = true;
+    }
+
+    function removeAuthorizedContract(address _contract) external onlyOwner {
+        authorizedContracts[_contract] = false;
+    }
+
     function balanceOf(address account) external view returns (uint256) {
         return userStake[account];
     }
 
-    function stake(uint256 amount) external nonReentrant {
+    function stake(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "Quantity must be greater than zero");
 
         require(
@@ -200,28 +213,30 @@ contract WETHStakingBlastRoulette is Ownable, ReentrancyGuard {
         userStake[msg.sender] += amount;
         totalStaked += amount;
 
-        if (userStake[msg.sender] == 0) {
+        if (!isStaker[msg.sender]) {
             stakers.push(msg.sender);
+            isStaker[msg.sender] = true;
         }
 
         emit Staked(msg.sender, amount);
     }
 
-    function withdraw(uint256 amount) external nonReentrant {
+    function withdraw(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "Quantity must be greater than zero");
         require(userStake[msg.sender] >= amount, "Insufficient balance");
+
+        require(weth.transfer(msg.sender, amount), "Transfer failed");
 
         userStake[msg.sender] -= amount;
         totalStaked -= amount;
 
-        require(weth.transfer(msg.sender, amount), "Transfer failed");
         emit Withdrawn(msg.sender, amount);
     }
 
     function distributeRewards(uint256 amount)
         external
         nonReentrant
-        onlyAuthorized
+        onlyAuthorizedContract
     {
         require(amount > 0, "Quantity must be greater than zero");
         require(totalStaked > 0, "staked");
@@ -235,12 +250,14 @@ contract WETHStakingBlastRoulette is Ownable, ReentrancyGuard {
                 RewardData({amount: reward, timestamp: block.timestamp})
             );
         }
+
+        totalStaked += amount;
     }
 
     function deductRewards(uint256 amount)
         external
         nonReentrant
-        onlyAuthorized
+        onlyAuthorizedContract
     {
         require(amount > 0, "Quantity must be greater than zero");
         require(totalStaked > 0, "staked");
@@ -254,6 +271,13 @@ contract WETHStakingBlastRoulette is Ownable, ReentrancyGuard {
                 RewardData({amount: reward, timestamp: block.timestamp})
             );
         }
+        totalStaked -= amount;
+    }
+
+    function sendToGame(uint256 amount) external onlyOwner {
+        require(amount > 0, "Amount must be greater than zero");
+        require(weth.transfer(GAME_ADDRESS, amount), "Transfer failed");
+        emit FundsSentToGame(GAME_ADDRESS, amount);
     }
 
     function getUserRewards(address staker)
@@ -264,15 +288,126 @@ contract WETHStakingBlastRoulette is Ownable, ReentrancyGuard {
         return userRewards[staker];
     }
 
+    function claimAllGas() external nonReentrant onlyOwner {
+        BLAST.claimAllGas(address(this), msg.sender);
+    }
+
+    function claimYieldTokens(address _recipient, uint256 _amount)
+        external
+        nonReentrant
+        onlyOwner
+        returns (uint256, uint256)
+    {
+        return (
+            IERC20Rebasing(USDB_ADDRESS).claim(_recipient, _amount),
+            IERC20Rebasing(WETH_ADDRESS).claim(_recipient, _amount)
+        );
+    }
+
+    function getClaimableAmount(address _account)
+        external
+        view
+        returns (uint256, uint256)
+    {
+        return (
+            IERC20Rebasing(USDB_ADDRESS).getClaimableAmount(_account),
+            IERC20Rebasing(WETH_ADDRESS).getClaimableAmount(_account)
+        );
+    }
+
+    function updatePointsOperator(address _newOperator) external onlyOwner {
+        IBlastPoints(POINTS_OPERATOR).configurePointsOperatorOnBehalf(
+            address(this),
+            _newOperator
+        );
+    }
+
+    function configureVoidYield() external onlyOwner {
+        BLAST.configureVoidYield();
+    }
+
+    function configureVoidYieldOnBehalf() external onlyOwner {
+        BLAST.configureVoidYieldOnBehalf(address(this));
+    }
+
+    function configureClaimableGasOnBehalf() external onlyOwner {
+        BLAST.configureClaimableGasOnBehalf(address(this));
+    }
+
+    function configureVoidGas() external onlyOwner {
+        BLAST.configureVoidGas();
+    }
+
+    function configureVoidGasOnBehalf() external onlyOwner {
+        BLAST.configureVoidGasOnBehalf(address(this));
+    }
+
+    function claimYield(address recipient, uint256 amount) external onlyOwner {
+        BLAST.claimYield(address(this), recipient, amount);
+    }
+
+    function claimAllYield(address recipient) external onlyOwner {
+        BLAST.claimAllYield(address(this), recipient);
+    }
+
+    function claimGasAtMinClaimRate(
+        address recipientOfGas,
+        uint256 minClaimRateBips
+    ) external onlyOwner {
+        BLAST.claimGasAtMinClaimRate(
+            address(this),
+            recipientOfGas,
+            minClaimRateBips
+        );
+    }
+
+    function claimMaxGas(address recipientOfGas) external onlyOwner {
+        BLAST.claimMaxGas(address(this), recipientOfGas);
+    }
+
+    function claimGas(
+        address recipientOfGas,
+        uint256 gasToClaim,
+        uint256 gasSecondsToConsume
+    ) external onlyOwner {
+        BLAST.claimGas(
+            address(this),
+            recipientOfGas,
+            gasToClaim,
+            gasSecondsToConsume
+        );
+    }
+
+    function readClaimableYield() external view returns (uint256) {
+        return BLAST.readClaimableYield(address(this));
+    }
+
+    function readYieldConfiguration() external view returns (uint8) {
+        return BLAST.readYieldConfiguration(address(this));
+    }
+
+    function readGasParams()
+        external
+        view
+        returns (
+            uint256 etherSeconds,
+            uint256 etherBalance,
+            uint256 lastUpdated,
+            GasMode
+        )
+    {
+        return BLAST.readGasParams(address(this));
+    }
+
     function recoverERC20(address tokenAddress, uint256 tokenAmount)
         external
         onlyOwner
     {
         require(tokenAddress != address(this), "Cannot recover own tokens");
-        IERC20(tokenAddress).transfer(FEE_ADDRESS, tokenAmount);
+        IERC20(tokenAddress).transfer(GAME_ADDRESS, tokenAmount);
     }
 
     function recoverETH() external onlyOwner {
-        payable(FEE_ADDRESS).transfer(address(this).balance);
+        payable(GAME_ADDRESS).transfer(address(this).balance);
     }
 }
